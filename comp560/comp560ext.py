@@ -7,6 +7,9 @@ and extensions without modifying core scripts like train.py, sample.py.
 
 import os
 import torch
+import json
+import pickle
+import tiktoken
 from torch.nn import functional as F
 
 config = {} # Should be overwritten by train.py or sample.py
@@ -31,6 +34,93 @@ def prepare_stop_token(stop_token, encode):
         if len(stop_ids) > 0:
             return stop_ids[0]
     return None
+
+def get_encoder_decoder(data_dir):
+    meta_path = os.path.join(data_dir, 'meta.pkl')
+    if os.path.exists(meta_path):
+        with open(meta_path, 'rb') as f:
+            meta = pickle.load(f)
+        stoi, itos = meta['stoi'], meta['itos']
+        encode = lambda s: [stoi[c] for c in s]
+        decode = lambda l: ''.join([itos[i] for i in l])
+    else:
+        enc = tiktoken.get_encoding("gpt2")
+        encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+        decode = lambda l: enc.decode(l)
+    return encode, decode
+
+def evaluate_accuracy(model, data_dir, device, config, max_samples=50):
+    val_data_path = os.path.join(data_dir, 'val.jsonl')
+    if not os.path.exists(val_data_path):
+        return None
+
+    encode, decode = get_encoder_decoder(data_dir)
+    
+    # Determine separator and stop_token from config
+    separator = config.get('separator', '=')  # Add separator if defined (e.g. "=")
+    # Stop token is crucial for generation to stop cleanly
+    stop_token_val = config.get('stop_token', "\n")
+    stop_token_id = prepare_stop_token(stop_token_val, encode)
+
+    num_correct = 0
+    num_total = 0
+
+    with open(val_data_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    
+    # Simple sampling if file is large, or just take first N
+    import random
+    if len(lines) > max_samples:
+        lines = random.sample(lines, max_samples)
+
+    model.eval()
+    with torch.no_grad():
+        for line in lines:
+            try:
+                example = json.loads(line)
+                prompt = example['input'] + separator
+                target = example['output']
+            except (json.JSONDecodeError, KeyError):
+                continue
+            
+            start_ids = encode(prompt)
+            x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+            
+            # Generate
+            # We need to generate enough tokens to cover the answer. 
+            # Assuming max_new_tokens=50 is enough for short outputs
+            y = generate(model, x, max_new_tokens=20, temperature=1.0, top_k=1, stop_token=stop_token_id)
+            
+            # Extract generated part
+            # y contains [prompt + generated]
+            # we need to decode only the generated part
+            generated_ids = y[0].tolist()[len(start_ids):]
+            generated_text = decode(generated_ids)
+            
+            # Check strict equality (or stripped)
+            # Depending on stop_token logic, generated_text might include the stop token or not?
+            # Our generate breaks on stop_token *match*. `idx_next` is appended before break?
+            # Let's check generate:
+            # idx = torch.cat((idx, idx_next), dim=1)
+            # if stop_token is not None and idx_next.item() == stop_token: break
+            # So the stop_token IS appended.
+            
+            # If we stop at \n, the text will have \n at the end. 
+            # We should probably strip it for comparison.
+            
+            # Strip stop token from generated text if it exists
+            if stop_token_val and generated_text.endswith(stop_token_val):
+                generated_text = generated_text[:-len(stop_token_val)]
+            
+            # Compare
+            if generated_text.strip() == target.strip():
+                num_correct += 1
+            num_total += 1
+            
+    model.train() # Switch back to train mode
+    
+    return num_correct / num_total if num_total > 0 else 0.0
+
 
 @torch.no_grad()
 def generate(model, idx, max_new_tokens, temperature=1.0, top_k=None, stop_token=None):

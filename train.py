@@ -266,14 +266,24 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        
+        # Calculate Validation Accuracy if val.jsonl exists
+        val_accuracy = comp560ext.evaluate_accuracy(model, data_dir, device, config)
+        if val_accuracy is not None:
+            print(f"step {iter_num}: val accuracy {val_accuracy:.4f}")
+
         if wandb_log:
-            wandb.log({
+            log_dict = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+            }
+            if val_accuracy is not None:
+                log_dict["val/accuracy"] = val_accuracy
+            wandb.log(log_dict)
+            
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
