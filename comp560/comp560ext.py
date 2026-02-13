@@ -87,8 +87,6 @@ def evaluate_accuracy(model, data_dir, device, config, max_samples=50):
             x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
             
             # Generate
-            # We need to generate enough tokens to cover the answer. 
-            # Assuming max_new_tokens=50 is enough for short outputs
             y = generate(model, x, max_new_tokens=20, temperature=1.0, top_k=1, stop_token=stop_token_id)
             
             # Extract generated part
@@ -96,17 +94,6 @@ def evaluate_accuracy(model, data_dir, device, config, max_samples=50):
             # we need to decode only the generated part
             generated_ids = y[0].tolist()[len(start_ids):]
             generated_text = decode(generated_ids)
-            
-            # Check strict equality (or stripped)
-            # Depending on stop_token logic, generated_text might include the stop token or not?
-            # Our generate breaks on stop_token *match*. `idx_next` is appended before break?
-            # Let's check generate:
-            # idx = torch.cat((idx, idx_next), dim=1)
-            # if stop_token is not None and idx_next.item() == stop_token: break
-            # So the stop_token IS appended.
-            
-            # If we stop at \n, the text will have \n at the end. 
-            # We should probably strip it for comparison.
             
             # Strip stop token from generated text if it exists
             if stop_token_val and generated_text.endswith(stop_token_val):
