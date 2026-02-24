@@ -5,6 +5,7 @@ This module provides additional functionality to support custom configurations
 and extensions without modifying core scripts like train.py, sample.py.
 """
 
+import json
 import os
 import sys
 from ast import literal_eval
@@ -103,4 +104,184 @@ def generate(model, idx, max_new_tokens, temperature=1.0, top_k=None, stop_token
             break
 
     return idx
+
+
+# ---------------------------------------------------------------------------
+# Benchmarking / Evaluation utilities
+# ---------------------------------------------------------------------------
+
+def load_eval_dataset(jsonl_path, max_samples=None):
+    """
+    Load a JSONL evaluation dataset where each line is a JSON object with
+    'input' and 'output' string keys.
+
+    Args:
+        jsonl_path:  Path to the .jsonl file.
+        max_samples: If given (positive int), only the first `max_samples` valid
+                     lines are returned.  None (default) loads the entire file.
+
+    Returns a list of {'input': str, 'output': str} dicts.
+    Raises FileNotFoundError if the file doesn't exist.
+    """
+    if not os.path.exists(jsonl_path):
+        raise FileNotFoundError(
+            f"Eval dataset not found: {jsonl_path}\n"
+            "Please ensure train.jsonl / val.jsonl exist in the dataset directory."
+        )
+    samples = []
+    with open(jsonl_path, 'r', encoding='utf-8') as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"JSON parse error on line {lineno} of {jsonl_path}: {e}")
+            if 'input' not in obj or 'output' not in obj:
+                raise ValueError(
+                    f"Line {lineno} in {jsonl_path} is missing 'input' or 'output' key."
+                )
+            samples.append({'input': obj['input'], 'output': obj['output']})
+            if max_samples is not None and len(samples) >= max_samples:
+                break
+    return samples
+
+
+@torch.no_grad()
+def run_tf_eval(model, eval_data, encode, separator_str, stop_token_str, device, ctx):
+    """
+    Fast Teacher Forcing (TF) Exact Match Evaluation.
+
+    For each sample the full sequence  (input + separator + output + stop)  is
+    fed through the model in a **single forward pass**.  The argmax predictions
+    are compared against the target tokens only in the *output region* — i.e.
+    the tokens that follow the separator up to and including the stop token.
+    A sample counts as an exact match only when every output token is predicted
+    correctly.
+
+    Args:
+        model:          The raw (non-DDP) model in train/eval compatible state.
+        eval_data:      List of {'input': str, 'output': str} dicts.
+        encode:         Callable str -> list[int].
+        separator_str:  String separating input from output (e.g. '=').
+        stop_token_str: String marking end of output (e.g. '\\n').
+        device:         torch device string.
+        ctx:            Autocast context (nullcontext or torch.amp.autocast).
+
+    Returns:
+        (accuracy_pct, exact_matches, total)  where accuracy_pct is 0–100.
+    """
+    model.eval()
+    exact_matches = 0
+    total = len(eval_data)
+
+    for sample in eval_data:
+        prefix_str = sample['input'] + separator_str
+        full_str   = prefix_str + sample['output'] + stop_token_str
+
+        prefix_ids = encode(prefix_str)
+        full_ids   = encode(full_str)
+
+        # Need at least 2 tokens to form an (x, y) pair.
+        if len(full_ids) < 2:
+            total -= 1
+            continue
+
+        x      = torch.tensor([full_ids[:-1]], dtype=torch.long, device=device)  # (1, T-1)
+        y_true = torch.tensor([full_ids[1:]],  dtype=torch.long, device=device)  # (1, T-1)
+
+        with ctx:
+            # Pass targets so nanoGPT returns full-sequence logits (1, T-1, vocab_size).
+            # Without targets, nanoGPT only computes the last position → (1, 1, vocab_size).
+            logits, _ = model(x, y_true)  # logits: (1, T-1, vocab_size)
+        pred = logits[0].argmax(dim=-1)   # (T-1,)
+
+        # The output region in y_true starts at index (len(prefix_ids) - 1).
+        # Explanation:
+        #   seq      = [i0..iN, sep, o0..oM, stop]
+        #   y_true   = seq[1:]  =>  y_true[len(prefix_ids)-1] == seq[len(prefix_ids)] == o0
+        out_start = len(prefix_ids) - 1
+        if out_start >= len(pred):
+            total -= 1
+            continue
+
+        if torch.equal(pred[out_start:], y_true[0, out_start:]):
+            exact_matches += 1
+
+    model.train()
+    accuracy = 100.0 * exact_matches / total if total > 0 else 0.0
+    return accuracy, exact_matches, total
+
+
+@torch.no_grad()
+def run_final_gen_eval(model, jsonl_path, encode, decode, separator_str, stop_token_str,
+                       max_new_tokens, temperature, top_k, device, ctx,
+                       max_samples=None):
+    """
+    Final autoregressive generation evaluation.
+
+    For each sample, only  (input + separator)  is fed as the prompt to
+    `generate`.  Generation stops when `stop_token` is produced (or
+    `max_new_tokens` is exhausted).  The decoded continuation is compared
+    against the expected output using exact string match.
+
+    Args:
+        model:          The raw (non-DDP) model.
+        jsonl_path:     Path to the .jsonl eval file.
+        encode:         Callable str -> list[int].
+        decode:         Callable list[int] -> str.
+        separator_str:  String appended to the input before feeding to generate.
+        stop_token_str: String whose first encoded token ID terminates generation.
+        max_new_tokens: Maximum number of tokens to generate per sample.
+        temperature:    Sampling temperature (use 1.0 for greedy-like behaviour).
+        top_k:          Top-k filtering (None = disabled).
+        device:         torch device string.
+        ctx:            Autocast context.
+        max_samples:    If given (positive int), evaluate only the first N samples.
+                        None (default) evaluates the entire file.
+
+    Returns:
+        (accuracy_pct, exact_matches, total)  where accuracy_pct is 0–100.
+    """
+    eval_data = load_eval_dataset(jsonl_path, max_samples=max_samples)
+    model.eval()
+
+    stop_ids      = encode(stop_token_str)
+    stop_token_id = stop_ids[0] if stop_ids else None
+
+    exact_matches = 0
+    total = len(eval_data)
+
+    for sample in eval_data:
+        prompt_str = sample['input'] + separator_str
+        prompt_ids = encode(prompt_str)
+        if not prompt_ids:
+            total -= 1
+            continue
+
+        prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+
+        with ctx:
+            out_tensor = generate(
+                model, prompt_tensor, max_new_tokens,
+                temperature=temperature, top_k=top_k,
+                stop_token=stop_token_id,
+            )
+
+        # Slice off only the newly generated tokens (after the prompt).
+        gen_ids = out_tensor[0, len(prompt_ids):].tolist()
+
+        # Strip trailing stop token if the model produced it.
+        if gen_ids and stop_token_id is not None and gen_ids[-1] == stop_token_id:
+            gen_ids = gen_ids[:-1]
+
+        generated_str = decode(gen_ids)
+
+        if generated_str == sample['output']:
+            exact_matches += 1
+
+    model.train()
+    accuracy = 100.0 * exact_matches / total if total > 0 else 0.0
+    return accuracy, exact_matches, total
 
