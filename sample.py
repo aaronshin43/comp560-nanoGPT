@@ -27,8 +27,7 @@ compile = False # use PyTorch 2.0 to compile the model to be faster
 stop_token = ""
 #########################################################
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-config_file = comp560ext.get_config_file()
-exec(open(config_file).read()) # overrides from command line or config file
+comp560ext.configure(globals())
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 comp560ext.config = config
 # -----------------------------------------------------------------------------

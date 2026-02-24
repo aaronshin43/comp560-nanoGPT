@@ -6,6 +6,8 @@ and extensions without modifying core scripts like train.py, sample.py.
 """
 
 import os
+import sys
+from ast import literal_eval
 import torch
 import json
 import pickle
@@ -13,6 +15,42 @@ import tiktoken
 from torch.nn import functional as F
 
 config = {} # Should be overwritten by train.py or sample.py
+
+def configure(globals_dict):
+    """
+    Parses command line arguments and updates the globals dictionary.
+    Replaces the functionality of configurator.py with improved parsing logic.
+    """
+    for arg in sys.argv[1:]:
+        if '=' not in arg:
+            # assume it's the name of a config file
+            assert not arg.startswith('--')
+            config_file = arg
+            print(f"Overriding config with {config_file}:")
+            with open(config_file) as f:
+                print(f.read())
+            exec(open(config_file).read(), globals_dict)
+        else:
+            # assume it's a --key=value argument
+            assert arg.startswith('--')
+            # FIX: Use maxsplit=1 to handle values containing '=' (e.g. --start="1+1=")
+            key, val = arg.split('=', 1)
+            key = key[2:]
+            if key in globals_dict:
+                try:
+                    # attempt to eval it it (e.g. if bool, number, or etc)
+                    attempt = literal_eval(val)
+                except (SyntaxError, ValueError):
+                    # if that goes wrong, just use the string
+                    attempt = val
+                # ensure the types match ok
+                assert type(attempt) == type(globals_dict[key])
+                # cross fingers
+                print(f"Overriding: {key} = {attempt}")
+                globals_dict[key] = attempt
+            else:
+                raise ValueError(f"Unknown config key: {key}")
+
 
 def get_config_file():
     return os.environ.get("NANOGPT_CONFIG", "configurator.py")
