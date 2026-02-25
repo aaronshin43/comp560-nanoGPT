@@ -103,6 +103,7 @@ enable_final_eval        = False   # run autoregressive gen eval after training 
 benchmark_target         = 'val'   # which split(s) to use for final gen eval: 'train'|'val'|'both'
 tf_eval_max_samples      = 0       # max samples for TF eval (0 = use all)
 final_eval_max_samples   = 0       # max samples for final gen eval (0 = use all)
+target_mask              = False   # if True, mask input tokens in y with -100 (loss computed on output only)
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 comp560ext.configure(globals())
@@ -145,6 +146,42 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+
+# Token IDs for target masking — populated from meta.pkl after vocab loading.
+# None disables masking even when target_mask=True (e.g. vocab not yet available).
+_sep_id  = None   # token ID of separator_token (e.g. '=')
+_stop_id = None   # token ID of stop_token      (e.g. '\n')
+
+def _apply_target_mask(y: torch.Tensor, sep_id: int, stop_id: int) -> torch.Tensor:
+    """
+    Replace input-region tokens in y with -100 (cross-entropy ignore_index).
+
+    Tokens from the start of each sample up to and including the separator are
+    masked; output tokens and the stop token keep their original IDs.
+
+    Uses fully-vectorised cumsum logic — single pass over (B, T), no Python loops.
+
+    Masking rule at position t:
+        stops_seen_before_t >= seps_seen_before_t  →  in 'input phase' → mask
+
+    Edge-case: a window that begins mid-output (before the first stop) will
+    incorrectly mask those leading output tokens until the first stop is seen.
+    This is a minor effect for short-sample / long-block-size settings.
+    """
+    B, T  = y.shape
+    # Inclusive cumulative counts (how many sep/stop seen up to and including t).
+    stop_cs  = torch.cumsum((y == stop_id).long(), dim=1)   # (B, T)
+    sep_cs   = torch.cumsum((y == sep_id ).long(), dim=1)   # (B, T)
+    # Shift right by 1 to get *exclusive* counts (seen *before* position t).
+    zeros    = torch.zeros(B, 1, dtype=torch.long)
+    stop_bef = torch.cat([zeros, stop_cs[:, :-1]], dim=1)   # (B, T)
+    sep_bef  = torch.cat([zeros, sep_cs [:, :-1]], dim=1)   # (B, T)
+    # We are in 'input phase' when stops_before >= seps_before.
+    in_input = stop_bef >= sep_bef                           # (B, T) bool mask
+    y = y.clone()
+    y[in_input] = -1   # nanoGPT uses ignore_index=-1 in F.cross_entropy (see model.py:189)
+    return y
+
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -155,6 +192,10 @@ def get_batch(split):
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    # Target masking: replace input-region tokens with -100 so the loss is
+    # computed on output tokens only.  Applied on CPU before the device transfer.
+    if target_mask and _sep_id is not None and _stop_id is not None:
+        y = _apply_target_mask(y, _sep_id, _stop_id)
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -195,6 +236,23 @@ if (enable_tf_eval or enable_final_eval) and master_process:
         )
         enable_tf_eval = False
         enable_final_eval = False
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Resolve separator / stop token IDs for target masking.
+# ---------------------------------------------------------------------------
+if target_mask:
+    _stoi_ref  = meta.get('stoi', {}) if meta_vocab_size is not None else {}
+    _sep_char  = separator_token[0] if separator_token else None
+    _stop_char = stop_token[0]      if stop_token      else None
+    if _sep_char in _stoi_ref and _stop_char in _stoi_ref:
+        _sep_id  = _stoi_ref[_sep_char]
+        _stop_id = _stoi_ref[_stop_char]
+        print(f"target_mask=True: masking input tokens up to separator "
+              f"(sep='{_sep_char}' id={_sep_id}, stop='{_stop_char}' id={_stop_id})")
+    else:
+        print("Warning: target_mask=True but separator/stop token not found in vocab — "
+              "target masking disabled.")
 # ---------------------------------------------------------------------------
 
 # model init
