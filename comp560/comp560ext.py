@@ -120,8 +120,13 @@ def load_eval_dataset(jsonl_path, max_samples=None):
         max_samples: If given (positive int), only the first `max_samples` valid
                      lines are returned.  None (default) loads the entire file.
 
-    Returns a list of {'input': str, 'output': str} dicts.
-    Raises FileNotFoundError if the file doesn't exist.
+    Returns:
+        List of {'input': str, 'output': str} dicts.
+
+    Raises:
+        FileNotFoundError: If the file does not exist at `jsonl_path`.
+        ValueError: If a line contains invalid JSON, or is missing the
+                    'input' or 'output' key.
     """
     if not os.path.exists(jsonl_path):
         raise FileNotFoundError(
@@ -172,6 +177,7 @@ def run_tf_eval(model, eval_data, encode, separator_str, stop_token_str, device,
     Returns:
         (accuracy_pct, exact_matches, total)  where accuracy_pct is 0–100.
     """
+    was_training = model.training
     model.eval()
     exact_matches = 0
     total = len(eval_data)
@@ -193,23 +199,24 @@ def run_tf_eval(model, eval_data, encode, separator_str, stop_token_str, device,
 
         with ctx:
             # Pass targets so nanoGPT returns full-sequence logits (1, T-1, vocab_size).
-            # Without targets, nanoGPT only computes the last position → (1, 1, vocab_size).
+            # Without targets, nanoGPT only returns the last position → (1, 1, vocab_size).
+            # The loss returned as the second value is discarded (_); only logits are needed.
             logits, _ = model(x, y_true)  # logits: (1, T-1, vocab_size)
         pred = logits[0].argmax(dim=-1)   # (T-1,)
 
         # The output region in y_true starts at index (len(prefix_ids) - 1).
-        # Explanation:
-        #   seq      = [i0..iN, sep, o0..oM, stop]
-        #   y_true   = seq[1:]  =>  y_true[len(prefix_ids)-1] == seq[len(prefix_ids)] == o0
+        # Derivation (using L = len(prefix_ids)):
+        #   full_ids = [p0..p_{L-1}, o0..o_M, stop]
+        #   y_true   = full_ids[1:]   =>   y_true[L-1] == full_ids[L] == o0
         out_start = len(prefix_ids) - 1
-        if out_start >= len(pred):
+        if out_start >= len(pred):   # output region is empty; skip
             total -= 1
             continue
 
         if torch.equal(pred[out_start:], y_true[0, out_start:]):
             exact_matches += 1
 
-    model.train()
+    model.train(was_training)   # restore original train/eval state
     accuracy = 100.0 * exact_matches / total if total > 0 else 0.0
     return accuracy, exact_matches, total
 
@@ -245,6 +252,7 @@ def run_final_gen_eval(model, jsonl_path, encode, decode, separator_str, stop_to
         (accuracy_pct, exact_matches, total)  where accuracy_pct is 0–100.
     """
     eval_data = load_eval_dataset(jsonl_path, max_samples=max_samples)
+    was_training = model.training
     model.eval()
 
     stop_ids      = encode(stop_token_str)
@@ -281,7 +289,92 @@ def run_final_gen_eval(model, jsonl_path, encode, decode, separator_str, stop_to
         if generated_str == sample['output']:
             exact_matches += 1
 
-    model.train()
+    model.train(was_training)   # restore original train/eval state
     accuracy = 100.0 * exact_matches / total if total > 0 else 0.0
     return accuracy, exact_matches, total
+
+
+def apply_target_mask(y: torch.Tensor, sep_id: int, stop_id: int) -> torch.Tensor:
+    """
+    Replace input-region tokens in y with -1 (nanoGPT's cross-entropy ignore_index).
+
+    Tokens from the start of each sample up to and including the separator are
+    masked; output tokens and the stop token keep their original IDs.
+
+    Uses fully-vectorised cumsum logic — single pass over (B, T), no Python loops.
+
+    Masking rule at position t:
+        stops_seen_before_t >= seps_seen_before_t  →  in 'input phase' → mask
+
+    Edge-case: a window that begins mid-output (before the first stop) will
+    incorrectly mask those leading output tokens until the first stop is seen.
+    This is a minor effect for short-sample / long-block-size settings.
+    """
+    B, T = y.shape
+    # Inclusive cumulative counts (how many sep/stop seen up to and including t).
+    stop_cs = torch.cumsum((y == stop_id).long(), dim=1)   # (B, T)
+    sep_cs  = torch.cumsum((y == sep_id ).long(), dim=1)   # (B, T)
+    # Shift right by 1 to get *exclusive* counts (seen *before* position t).
+    zeros    = torch.zeros(B, 1, dtype=torch.long, device=y.device)
+    stop_bef = torch.cat([zeros, stop_cs[:, :-1]], dim=1)  # (B, T)
+    sep_bef  = torch.cat([zeros, sep_cs [:, :-1]], dim=1)  # (B, T)
+    # We are in 'input phase' when stops_before >= seps_before.
+    in_input = stop_bef >= sep_bef                          # (B, T) bool mask
+    y = y.clone()
+    y[in_input] = -1   # nanoGPT uses ignore_index=-1 in F.cross_entropy (see model.py:189)
+    return y
+
+
+def setup_char_encode_decode(meta, meta_vocab_size):
+    """
+    Build character-level encode/decode callables from a loaded meta.pkl dict.
+
+    Args:
+        meta:            Dict loaded from meta.pkl, or None if meta.pkl was not found.
+        meta_vocab_size: vocab_size from meta, or None if meta was not loaded.
+
+    Returns:
+        (encode, decode) callables on success; (None, None) if stoi/itos are missing.
+        Prints a warning in the failure case.
+    """
+    if meta is not None and 'stoi' in meta and 'itos' in meta:
+        _stoi  = meta['stoi']
+        _itos  = meta['itos']
+        encode = lambda s: [_stoi[c] for c in s]
+        decode = lambda l: ''.join([_itos[i] for i in l])
+        print(f"encode/decode ready for benchmarking (vocab_size={meta_vocab_size})")
+        return encode, decode
+    print(
+        "Warning: meta.pkl not found or missing 'stoi'/'itos' — "
+        "benchmarking eval (enable_tf_eval / enable_final_eval) will be skipped."
+    )
+    return None, None
+
+
+def resolve_mask_token_ids(meta, meta_vocab_size, separator_token, stop_token):
+    """
+    Resolve token IDs for the separator and stop tokens from a loaded meta.pkl dict.
+
+    Args:
+        meta:            Dict loaded from meta.pkl, or None if meta.pkl was not found.
+        meta_vocab_size: vocab_size from meta, or None if meta was not loaded.
+        separator_token: String separating input from output (e.g. '=').
+        stop_token:      String marking end of output (e.g. '\\n').
+
+    Returns:
+        (sep_id, stop_id) ints on success; (None, None) if either token is not in vocab.
+        Prints a warning in the failure case.
+    """
+    stoi      = meta.get('stoi', {}) if meta_vocab_size is not None else {}
+    sep_char  = separator_token[0] if separator_token else None
+    stop_char = stop_token[0]      if stop_token      else None
+    if sep_char in stoi and stop_char in stoi:
+        sep_id  = stoi[sep_char]
+        stop_id = stoi[stop_char]
+        print(f"target_mask=True: masking input tokens up to separator "
+              f"(sep='{sep_char}' id={sep_id}, stop='{stop_char}' id={stop_id})")
+        return sep_id, stop_id
+    print("Warning: target_mask=True but separator/stop token not found in vocab — "
+          "target masking disabled.")
+    return None, None
 
