@@ -1,22 +1,18 @@
 """
 Benchmark-augmented training script.
 
-Identical to train.py with two additional evaluation features:
+Identical to train.py with one additional evaluation feature:
 
-  1. Fast Teacher Forcing (TF) Exact Match Evaluation  (enable_tf_eval=True)
-     Runs every `eval_interval` iterations.  Feeds the complete sequence
-     (input + separator + output + stop) in one forward pass, takes argmax,
-     and reports exact-match accuracy on the output tokens only.
-     Optionally halts training when TF accuracy first reaches 100 %
-     (early_stop_on_perfect_tf=True).
+  Fast Teacher Forcing (TF) Exact Match Evaluation  (enable_tf_eval=True)
+  Runs every `eval_interval` iterations.  Feeds the complete sequence
+  (input + separator + output + stop) in one forward pass, takes argmax,
+  and reports exact-match accuracy on the output tokens only.
+  Optionally halts training when TF accuracy first reaches 100 %
+  (early_stop_on_perfect_tf=True).
 
-  2. Final Autoregressive Generation Evaluation  (enable_final_eval=True)
-     Runs once after the training loop ends (or after early-stop).
-     Feeds only (input + separator) as the prompt to `generate`, stops on
-     `stop_token`, and reports exact-match accuracy.
-     Controlled by `benchmark_target`: 'train' | 'val' | 'both'.
+For autoregressive generation evaluation after training, use eval_checkpoint.py.
 
-Both features require:
+TF eval requires:
   • data/<dataset>/train.jsonl  and/or  data/<dataset>/val.jsonl
     Each line: {"input": "...", "output": "..."}
   • data/<dataset>/meta.pkl containing 'stoi' and 'itos' maps
@@ -28,9 +24,6 @@ Usage examples:
 
   # Enable TF eval every eval_interval, early-stop at 100 %:
   python train_benchmark.py config/my_config.py --enable_tf_eval=True --early_stop_on_perfect_tf=True
-
-  # Run final gen eval on both splits after training:
-  python train_benchmark.py config/my_config.py --enable_final_eval=True --benchmark_target=both
 
 To run with DDP on 4 gpus on 1 node, example:
 $ torchrun --standalone --nproc_per_node=4 train_benchmark.py
@@ -99,11 +92,9 @@ separator_token          = '='     # string that separates input from output in 
 stop_token               = '\n'    # string that marks the end of the output
 enable_tf_eval           = False   # run Fast TF Exact Match eval every eval_interval
 early_stop_on_perfect_tf = False   # halt training when TF exact-match first reaches 100 %
-enable_final_eval        = False   # run autoregressive gen eval after training ends
-benchmark_target         = 'val'   # which split(s) to use for final gen eval: 'train'|'val'|'both'
+benchmark_target         = 'val'   # which split(s) to load for TF eval: 'train'|'val'|'both'
 tf_eval_max_samples      = 0       # max samples for TF eval (0 = use all)
-final_eval_max_samples   = 0       # max samples for final gen eval (0 = use all)
-target_mask              = False   # if True, mask input tokens in y with -100 (loss computed on output only)
+target_mask              = False   # if True, mask input tokens in y with -1 (loss computed on output only)
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 comp560ext.configure(globals())
@@ -152,36 +143,6 @@ data_dir = os.path.join('data', dataset)
 _sep_id  = None   # token ID of separator_token (e.g. '=')
 _stop_id = None   # token ID of stop_token      (e.g. '\n')
 
-def _apply_target_mask(y: torch.Tensor, sep_id: int, stop_id: int) -> torch.Tensor:
-    """
-    Replace input-region tokens in y with -100 (cross-entropy ignore_index).
-
-    Tokens from the start of each sample up to and including the separator are
-    masked; output tokens and the stop token keep their original IDs.
-
-    Uses fully-vectorised cumsum logic — single pass over (B, T), no Python loops.
-
-    Masking rule at position t:
-        stops_seen_before_t >= seps_seen_before_t  →  in 'input phase' → mask
-
-    Edge-case: a window that begins mid-output (before the first stop) will
-    incorrectly mask those leading output tokens until the first stop is seen.
-    This is a minor effect for short-sample / long-block-size settings.
-    """
-    B, T  = y.shape
-    # Inclusive cumulative counts (how many sep/stop seen up to and including t).
-    stop_cs  = torch.cumsum((y == stop_id).long(), dim=1)   # (B, T)
-    sep_cs   = torch.cumsum((y == sep_id ).long(), dim=1)   # (B, T)
-    # Shift right by 1 to get *exclusive* counts (seen *before* position t).
-    zeros    = torch.zeros(B, 1, dtype=torch.long)
-    stop_bef = torch.cat([zeros, stop_cs[:, :-1]], dim=1)   # (B, T)
-    sep_bef  = torch.cat([zeros, sep_cs [:, :-1]], dim=1)   # (B, T)
-    # We are in 'input phase' when stops_before >= seps_before.
-    in_input = stop_bef >= sep_bef                           # (B, T) bool mask
-    y = y.clone()
-    y[in_input] = -1   # nanoGPT uses ignore_index=-1 in F.cross_entropy (see model.py:189)
-    return y
-
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -192,10 +153,10 @@ def get_batch(split):
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    # Target masking: replace input-region tokens with -100 so the loss is
+    # Target masking: replace input-region tokens with -1 so the loss is
     # computed on output tokens only.  Applied on CPU before the device transfer.
     if target_mask and _sep_id is not None and _stop_id is not None:
-        y = _apply_target_mask(y, _sep_id, _stop_id)
+        y = comp560ext.apply_target_mask(y, _sep_id, _stop_id)
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -216,44 +177,19 @@ if os.path.exists(meta_path):
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
-# ---------------------------------------------------------------------------
-# Setup encode/decode for benchmarking eval (character-level vocab via meta.pkl).
-# Only attempted when at least one benchmarking mode is active.
-# ---------------------------------------------------------------------------
+# Setup encode/decode callables for benchmarking eval (character-level via meta.pkl).
+_meta = meta if meta_vocab_size is not None else None
 encode = None
-decode = None
-if (enable_tf_eval or enable_final_eval) and master_process:
-    if os.path.exists(meta_path) and 'stoi' in meta and 'itos' in meta:
-        _stoi = meta['stoi']
-        _itos = meta['itos']
-        encode = lambda s: [_stoi[c] for c in s]
-        decode = lambda l: ''.join([_itos[i] for i in l])
-        print(f"encode/decode ready for benchmarking (vocab_size={meta_vocab_size})")
-    else:
-        print(
-            "Warning: meta.pkl not found or missing 'stoi'/'itos' — "
-            "benchmarking eval (enable_tf_eval / enable_final_eval) will be skipped."
-        )
+if enable_tf_eval and master_process:
+    encode, _ = comp560ext.setup_char_encode_decode(_meta, meta_vocab_size)
+    if encode is None:
         enable_tf_eval = False
-        enable_final_eval = False
-# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
 # Resolve separator / stop token IDs for target masking.
-# ---------------------------------------------------------------------------
 if target_mask:
-    _stoi_ref  = meta.get('stoi', {}) if meta_vocab_size is not None else {}
-    _sep_char  = separator_token[0] if separator_token else None
-    _stop_char = stop_token[0]      if stop_token      else None
-    if _sep_char in _stoi_ref and _stop_char in _stoi_ref:
-        _sep_id  = _stoi_ref[_sep_char]
-        _stop_id = _stoi_ref[_stop_char]
-        print(f"target_mask=True: masking input tokens up to separator "
-              f"(sep='{_sep_char}' id={_sep_id}, stop='{_stop_char}' id={_stop_id})")
-    else:
-        print("Warning: target_mask=True but separator/stop token not found in vocab — "
-              "target masking disabled.")
-# ---------------------------------------------------------------------------
+    _sep_id, _stop_id = comp560ext.resolve_mask_token_ids(
+        _meta, meta_vocab_size, separator_token, stop_token
+    )
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
@@ -492,31 +428,6 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
-
-# ---------------------------------------------------------------------------
-# Final Autoregressive Generation Evaluation
-# ---------------------------------------------------------------------------
-if enable_final_eval and master_process and encode is not None and decode is not None:
-    splits = ['train', 'val'] if benchmark_target == 'both' else [benchmark_target]
-    for split in splits:
-        jsonl_path = os.path.join(data_dir, f'{split}.jsonl')
-        print(f"\nRunning final gen eval on [{split}] ({jsonl_path}) ...")
-        try:
-            acc, em, total = comp560ext.run_final_gen_eval(
-                raw_model, jsonl_path, encode, decode,
-                separator_str=separator_token,
-                stop_token_str=stop_token,
-                max_new_tokens=block_size,
-                temperature=1.0,
-                top_k=None,
-                device=device,
-                ctx=ctx,
-                max_samples=final_eval_max_samples if final_eval_max_samples > 0 else None,
-            )
-            print(f"Final gen eval [{split}]: {acc:.1f}% exact-match ({em}/{total})")
-        except FileNotFoundError as e:
-            print(f"Warning: {e}")
-# ---------------------------------------------------------------------------
 
 if ddp:
     destroy_process_group()
