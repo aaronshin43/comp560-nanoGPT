@@ -5,17 +5,17 @@ Loads a trained nanoGPT checkpoint and runs exact-match generation eval
 on one or both JSONL splits, using comp560ext.run_final_gen_eval.
 
 Usage:
-    python eval_gen.py \
+    python eval_generation.py \
         --out_dir=out-my-run \
         --dataset=shakespeare_char \
         --benchmark_target=val
 
     # Evaluate both splits, limit to 200 samples each:
-    python eval_gen.py --out_dir=out-add --dataset=addition \
+    python eval_generation.py --out_dir=out-add --dataset=addition \
         --benchmark_target=both --eval_max_samples=200
 
     # Adjust generation settings:
-    python eval_gen.py --out_dir=out-add --dataset=addition \
+    python eval_generation.py --out_dir=out-add --dataset=addition \
         --temperature=0.8 --top_k=10 --max_new_tokens=32
 
 Required files (relative to the project root):
@@ -35,7 +35,7 @@ from comp560 import comp560ext
 
 # -----------------------------------------------------------------------------
 # Configuration — all values can be overridden from the command line, e.g.:
-#   python eval_gen.py --out_dir=out-my-run --benchmark_target=both
+#   python eval_generation.py --out_dir=out-my-run --benchmark_target=both
 # -----------------------------------------------------------------------------
 out_dir          = 'out'         # directory that contains ckpt.pt
 dataset          = 'shakespeare_char'
@@ -97,7 +97,7 @@ print(f"Model loaded  (checkpoint iter={ckpt_iter}, "
       f"n_layer={model_args['n_layer']}, n_head={model_args['n_head']}, "
       f"n_embd={model_args['n_embd']})")
 
-# ── Load tokeniser ────────────────────────────────────────────────────────────
+# ── Load tokenizer ─────────────────────────────────────────────────────────────
 data_dir  = os.path.join('data', dataset)
 meta_path = os.path.join(data_dir, 'meta.pkl')
 
@@ -114,11 +114,14 @@ with open(meta_path, 'rb') as f:
 if 'stoi' not in meta or 'itos' not in meta:
     raise KeyError("meta.pkl must contain 'stoi' and 'itos' mappings.")
 
+# Build encode/decode inline rather than via comp560ext.setup_char_encode_decode().
+# Unlike the training script (which soft-fails and disables eval), this script
+# cannot proceed without a working tokenizer, so hard failures are correct here.
 stoi   = meta['stoi']
 itos   = meta['itos']
 encode = lambda s: [stoi[c] for c in s]
 decode = lambda l: ''.join([itos[i] for i in l])
-print(f"Tokeniser ready  (vocab_size={meta['vocab_size']})")
+print(f"Tokenizer ready  (vocab_size={meta['vocab_size']})")
 
 # ── Run generation eval ───────────────────────────────────────────────────────
 _splits     = ['train', 'val'] if benchmark_target == 'both' else [benchmark_target]
