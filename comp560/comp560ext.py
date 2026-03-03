@@ -252,7 +252,6 @@ def run_final_gen_eval(model, jsonl_path, encode, decode, separator_str, stop_to
         (accuracy_pct, exact_matches, total)  where accuracy_pct is 0–100.
     """
     eval_data = load_eval_dataset(jsonl_path, max_samples=max_samples)
-    was_training = model.training
     model.eval()
 
     stop_ids      = encode(stop_token_str)
@@ -289,7 +288,6 @@ def run_final_gen_eval(model, jsonl_path, encode, decode, separator_str, stop_to
         if generated_str == sample['output']:
             exact_matches += 1
 
-    model.train(was_training)   # restore original train/eval state
     accuracy = 100.0 * exact_matches / total if total > 0 else 0.0
     return accuracy, exact_matches, total
 
